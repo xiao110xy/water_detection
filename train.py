@@ -50,8 +50,8 @@ def train(
         # Load weights to resume from
         model.load_state_dict(checkpoint['model'])
 
-        # if torch.cuda.device_count() > 1:
-        #   model = nn.DataParallel(model)
+        if torch.cuda.device_count() > 1:
+            model = nn.DataParallel(model)
         model.to(device).train()
 
         # Transfer learning (train only YOLO layers)
@@ -77,8 +77,8 @@ def train(
             load_darknet_weights(model, weights + 'yolov3-tiny.conv.15')
             cutoff = 15
 
-        # if torch.cuda.device_count() > 1:
-        #    model = nn.DataParallel(model)
+        if torch.cuda.device_count() > 1:
+            model = nn.DataParallel(model)
         model.to(device).train()
 
         # Set optimizer
@@ -109,16 +109,18 @@ def train(
             g['lr'] = lr
 
         # Freeze darknet53.conv.74 for first epoch
-        if freeze_backbone and (epoch < 2):
+        if freeze_backbone and (epoch == 0):
             for i, (name, p) in enumerate(model.named_parameters()):
                 if int(name.split('.')[1]) < cutoff:  # if layer < 75
                     p.requires_grad = False if (epoch == 0) else True
 
         ui = -1
-        rloss = defaultdict(float)  # running loss
         optimizer.zero_grad()
+        rloss = defaultdict(float)
         for i, (imgs, targets, _, _) in enumerate(dataloader):
-            if sum([len(x) for x in targets]) < 1:  # if no targets continue
+            targets = targets.to(device)
+            nT = targets.shape[0]
+            if nT == 0:  # if no targets continue
                 continue
 
             # SGD burn-in
@@ -127,8 +129,15 @@ def train(
                 for g in optimizer.param_groups:
                     g['lr'] = lr
 
+            # Run model
+            pred = model(imgs.to(device))
+
+            # Build targets
+            target_list = build_targets(model, targets, pred)
+
             # Compute loss
-            loss = model(imgs.to(device), targets, var=var)
+            # loss = model(imgs.to(device), targets, var=var)
+            loss, loss_dict = compute_loss(pred, target_list)
 
             # Compute gradient
             loss.backward()
@@ -140,21 +149,26 @@ def train(
 
             # Running epoch-means of tracked metrics
             ui += 1
-            for key, val in model.losses.items():
+            for key, val in loss_dict.items():
                 rloss[key] = (rloss[key] * ui + val) / (ui + 1)
 
             s = ('%8s%12s' + '%10.3g' * 7) % (
                 '%g/%g' % (epoch, epochs - 1),
                 '%g/%g' % (i, len(dataloader) - 1),
                 rloss['xy'], rloss['wh'], rloss['conf'],
-                rloss['cls'], rloss['loss'],
-                model.losses['nT'], time.time() - t0)
+                rloss['cls'], rloss['total'],
+                nT, time.time() - t0)
             t0 = time.time()
             print(s)
 
         # Update best loss
+<<<<<<< HEAD
         if rloss['loss'] < best_loss:
             best_loss = rloss['loss']
+=======
+        if rloss['total'] < best_loss:
+            best_loss = rloss['total']
+>>>>>>> multi_gpu
 
         # Save latest checkpoint
         checkpoint = {'epoch': epoch,
@@ -164,7 +178,11 @@ def train(
         torch.save(checkpoint, latest)
 
         # Save best checkpoint
+<<<<<<< HEAD
         if best_loss == rloss['loss']:
+=======
+        if best_loss == rloss['total']:
+>>>>>>> multi_gpu
             os.system('cp ' + latest + ' ' + best)
 
         # Save backup weights every 5 epochs (optional)

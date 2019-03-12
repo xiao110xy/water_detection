@@ -1,7 +1,4 @@
 import os
-from collections import defaultdict
-
-import torch.nn as nn
 
 from utils.parse_config import *
 from utils.utils import *
@@ -104,20 +101,21 @@ class YOLOLayer(nn.Module):
     def __init__(self, anchors, nC, img_size, yolo_layer, cfg):
         super(YOLOLayer, self).__init__()
 
-        nA = len(anchors)
         self.anchors = torch.FloatTensor(anchors)
-        self.nA = nA  # number of anchors (3)
+        self.nA = len(anchors)  # number of anchors (3)
         self.nC = nC  # number of classes (80)
         self.img_size = 0
         # self.coco_class_weights = coco_class_weights()
 
-        if ONNX_EXPORT:  # grids must be computed in __init__
-            stride = [32, 16, 8][yolo_layer]  # stride of this layer
-            if cfg.endswith('yolov3-tiny.cfg'):
-                stride *= 2
+        # if ONNX_EXPORT:  # grids must be computed in __init__
+        stride = [32, 16, 8][yolo_layer]  # stride of this layer
+        if cfg.endswith('yolov3-tiny.cfg'):
+            stride *= 2
 
-            self.nG = int(img_size / stride)  # number grid points
-            create_grids(self, img_size, self.nG)
+        nG = int(img_size / stride)  # number grid points
+
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        create_grids(self, img_size, nG, device)
 
     def forward(self, p, img_size, targets=None, var=None):
         if ONNX_EXPORT:
@@ -126,13 +124,9 @@ class YOLOLayer(nn.Module):
             bs, nG = p.shape[0], p.shape[-1]
 
             if self.img_size != img_size:
-                create_grids(self, img_size, nG)
+                create_grids(self, img_size, nG, p.device)
 
-                if p.is_cuda:
-                    self.grid_xy = self.grid_xy.cuda()
-                    self.anchor_wh = self.anchor_wh.cuda()
-
-        # p.view(bs, 255, 13, 13) -- > (bs, 3, 13, 13, 80)  # (bs, anchors, grid, grid, classes + xywh)
+        # p.view(bs, 255, 13, 13) -- > (bs, 3, 13, 13, 85)  # (bs, anchors, grid, grid, classes + xywh)
         p = p.view(bs, self.nA, self.nC + 5, nG, nG).permute(0, 1, 3, 4, 2).contiguous()  # prediction
 
         # xy, width and height
@@ -140,67 +134,33 @@ class YOLOLayer(nn.Module):
         wh = p[..., 2:4]  # wh (yolo method)
         # wh = torch.sigmoid(p[..., 2:4])  # wh (power method)
 
-        # Training
-        if targets is not None:
-            MSELoss = nn.MSELoss()
-            BCEWithLogitsLoss = nn.BCEWithLogitsLoss()
-            CrossEntropyLoss = nn.CrossEntropyLoss()
+        if self.training:
+            return p
 
-            # Get outputs
-            p_conf = p[..., 4]  # Conf
-            p_cls = p[..., 5:]  # Class
+        elif ONNX_EXPORT:
+            grid_xy = self.grid_xy.repeat((1, self.nA, 1, 1, 1)).view((1, -1, 2))
+            anchor_wh = self.anchor_wh.repeat((1, 1, nG, nG, 1)).view((1, -1, 2)) / nG
 
-            txy, twh, mask, tcls = build_targets(targets, self.anchor_vec, self.nA, self.nC, nG)
+            # p = p.view(-1, 85)
+            # xy = xy + self.grid_xy[0]  # x, y
+            # wh = torch.exp(wh) * self.anchor_wh[0]  # width, height
+            # p_conf = torch.sigmoid(p[:, 4:5])  # Conf
+            # p_cls = F.softmax(p[:, 5:85], 1) * p_conf  # SSD-like conf
+            # return torch.cat((xy / nG, wh, p_conf, p_cls), 1).t()
 
-            tcls = tcls[mask]
-            if p.is_cuda:
-                txy, twh, mask, tcls = txy.cuda(), twh.cuda(), mask.cuda(), tcls.cuda()
+            p = p.view(1, -1, 85)
+            xy = xy + grid_xy  # x, y
+            wh = torch.exp(p[..., 2:4]) * anchor_wh  # width, height
+            p_conf = torch.sigmoid(p[..., 4:5])  # Conf
+            p_cls = p[..., 5:85]
+            # Broadcasting only supported on first dimension in CoreML. See onnx-coreml/_operators.py
+            # p_cls = F.softmax(p_cls, 2) * p_conf  # SSD-like conf
+            p_cls = torch.exp(p_cls).permute((2, 1, 0))
+            p_cls = p_cls / p_cls.sum(0).unsqueeze(0) * p_conf.permute((2, 1, 0))  # F.softmax() equivalent
+            p_cls = p_cls.permute(2, 1, 0)
+            return torch.cat((xy / nG, wh, p_conf, p_cls), 2).squeeze().t()
 
-            # Compute losses
-            nT = sum([len(x) for x in targets])  # number of targets
-            nM = mask.sum().float()  # number of anchors (assigned to targets)
-            k = 1  # nM / bs
-            if nM > 0:
-                lxy = k * MSELoss(xy[mask], txy[mask])
-                lwh = k * MSELoss(wh[mask], twh[mask])
-
-                lcls = (k / 4) * CrossEntropyLoss(p_cls[mask], torch.argmax(tcls, 1))
-                # lcls = (k * 10) * BCEWithLogitsLoss(p_cls[mask], tcls.float())
-            else:
-                FT = torch.cuda.FloatTensor if p.is_cuda else torch.FloatTensor
-                lxy, lwh, lcls, lconf = FT([0]), FT([0]), FT([0]), FT([0])
-
-            lconf = (k * 64) * BCEWithLogitsLoss(p_conf, mask.float())
-
-            # Sum loss components
-            loss = lxy + lwh + lconf + lcls
-
-            return loss, loss.item(), lxy.item(), lwh.item(), lconf.item(), lcls.item(), nT
-
-        else:
-            if ONNX_EXPORT:
-                grid_xy = self.grid_xy.repeat((1, self.nA, 1, 1, 1)).view((1, -1, 2))
-                anchor_wh = self.anchor_wh.repeat((1, 1, nG, nG, 1)).view((1, -1, 2)) / nG
-
-                # p = p.view(-1, 85)
-                # xy = xy + self.grid_xy[0]  # x, y
-                # wh = torch.exp(wh) * self.anchor_wh[0]  # width, height
-                # p_conf = torch.sigmoid(p[:, 4:5])  # Conf
-                # p_cls = F.softmax(p[:, 5:85], 1) * p_conf  # SSD-like conf
-                # return torch.cat((xy / nG, wh, p_conf, p_cls), 1).t()
-
-                p = p.view(1, -1, 85)
-                xy = xy + grid_xy  # x, y
-                wh = torch.exp(p[..., 2:4]) * anchor_wh  # width, height
-                p_conf = torch.sigmoid(p[..., 4:5])  # Conf
-                p_cls = p[..., 5:85]
-                # Broadcasting only supported on first dimension in CoreML. See onnx-coreml/_operators.py
-                # p_cls = F.softmax(p_cls, 2) * p_conf  # SSD-like conf
-                p_cls = torch.exp(p_cls).permute((2, 1, 0))
-                p_cls = p_cls / p_cls.sum(0).unsqueeze(0) * p_conf.permute((2, 1, 0))  # F.softmax() equivalent
-                p_cls = p_cls.permute(2, 1, 0)
-                return torch.cat((xy / nG, wh, p_conf, p_cls), 2).squeeze().t()
-
+        else:  # inference
             p[..., 0:2] = xy + self.grid_xy  # xy
             p[..., 2:4] = torch.exp(wh) * self.anchor_wh  # wh yolo method
             # p[..., 2:4] = ((wh * 2) ** 2) * self.anchor_wh  # wh power method
@@ -226,8 +186,6 @@ class Darknet(nn.Module):
         self.losses = []
 
     def forward(self, x, targets=None, var=0):
-        self.losses = defaultdict(float)
-        is_training = targets is not None
         img_size = x.shape[-1]
         layer_outputs = []
         output = []
@@ -246,23 +204,21 @@ class Darknet(nn.Module):
                 layer_i = int(module_def['from'])
                 x = layer_outputs[-1] + layer_outputs[layer_i]
             elif mtype == 'yolo':
-                if is_training:  # get loss
-                    x, *losses = module[0](x, img_size, targets, var)
-                    for name, loss in zip(self.loss_names, losses):
-                        self.losses[name] += loss
-                else:  # get detections
-                    x = module[0](x, img_size)
+                # if self.training:  # get loss
+                #     x, *losses = module[0](x, img_size, targets, var)
+                #     for name, loss in zip(self.loss_names, losses):
+                #         self.losses[name] += loss
+                # else:  # get detections
+                #     x = module[0](x, img_size)
+                x = module[0](x, img_size)
                 output.append(x)
             layer_outputs.append(x)
-
-        if is_training:
-            self.losses['nT'] /= 3
 
         if ONNX_EXPORT:
             output = torch.cat(output, 1)  # merge the 3 layers 85 x (507, 2028, 8112) to 85 x 10647
             return output[5:85].t(), output[:4].t()  # ONNX scores, boxes
-
-        return sum(output) if is_training else torch.cat(output, 1)
+        else:
+            return output if self.training else torch.cat(output, 1)
 
 
 def get_yolo_layers(model):
@@ -270,18 +226,18 @@ def get_yolo_layers(model):
     return [i for i, x in enumerate(a) if x]  # [82, 94, 106] for yolov3
 
 
-def create_grids(self, img_size, nG):
+def create_grids(self, img_size, nG, device):
     self.stride = img_size / nG
 
     # build xy offsets
     grid_x = torch.arange(nG).repeat((nG, 1)).view((1, 1, nG, nG)).float()
     grid_y = grid_x.permute(0, 1, 3, 2)
-    self.grid_xy = torch.stack((grid_x, grid_y), 4)
+    self.grid_xy = torch.stack((grid_x, grid_y), 4).to(device)
 
     # build wh gains
-    self.anchor_vec = self.anchors / self.stride
-    self.anchor_wh = self.anchor_vec.view(1, self.nA, 1, 1, 2)
-
+    self.anchor_vec = self.anchors.to(device) / self.stride
+    self.anchor_wh = self.anchor_vec.view(1, self.nA, 1, 1, 2).to(device)
+    self.nG = torch.FloatTensor([nG]).to(device)
 
 def load_darknet_weights(self, weights, cutoff=-1):
     # Parses and loads the weights stored in 'weights'

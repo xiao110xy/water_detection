@@ -1,10 +1,12 @@
 import glob
 import random
+from collections import defaultdict
 
 import cv2
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 from utils import torch_utils
@@ -231,74 +233,112 @@ def bbox_iou(box1, box2, x1y1x2y2=True):
     return inter_area / (b1_area + b2_area - inter_area + 1e-16)
 
 
-def build_targets(target, anchor_vec, nA, nC, nG):
-    """
-    returns nT, nCorrect, tx, ty, tw, th, tconf, tcls
-    """
-    nB = len(target)  # number of images in batch
+def compute_loss(p, targets):  # model, predictions, targets
+    FT = torch.cuda.FloatTensor if p[0].is_cuda else torch.FloatTensor
+    loss, lxy, lwh, lcls, lconf = FT([0]), FT([0]), FT([0]), FT([0]), FT([0])
+    txy, twh, tcls, tconf, indices = targets
 
-    txy = torch.zeros(nB, nA, nG, nG, 2)  # batch size, anchors, grid size
-    twh = torch.zeros(nB, nA, nG, nG, 2)
-    tconf = torch.ByteTensor(nB, nA, nG, nG).fill_(0)
-    tcls = torch.ByteTensor(nB, nA, nG, nG, nC).fill_(0)  # nC = number of classes
+    # Group all yolo layers togethor
+    for i in range(len(p)):
+        pi0 = p[i]  # .view(-1, n)
+        b, a, gj, gi = indices[i]  # image, anchor, gridx, gridy
 
-    for b in range(nB):
-        t = target[b]
-        nTb = len(t)  # number of targets
-        if nTb == 0:
-            continue
+        # Compute losses
+        k = 1  # nT / bs
+        if len(b) > 0:
+            pi = pi0[b, a, gj, gi]
+            lxy += k * nn.MSELoss()(torch.sigmoid(pi[..., 0:2]), txy[i])  # xy
+            lwh += k * nn.MSELoss()(pi[..., 2:4], twh[i])  # wh
+            lcls += (k / 4) * nn.CrossEntropyLoss()(pi[..., 5:], tcls[i])
 
-        gxy, gwh = t[:, 1:3] * nG, t[:, 3:5] * nG
+        lconf += (k * 64) * nn.BCEWithLogitsLoss()(pi0[..., 4], tconf[i])
+    loss = lxy + lwh + lconf + lcls
 
-        # Get grid box indices and prevent overflows (i.e. 13.01 on 13 anchors)
-        gi, gj = torch.clamp(gxy.long(), min=0, max=nG - 1).t()
+    # Add to dictionary
+    d = defaultdict(float)
+    losses = [loss.item(), lxy.item(), lwh.item(), lconf.item(), lcls.item()]
+    for name, x in zip(['total', 'xy', 'wh', 'conf', 'cls'], losses):
+        d[name] = x
 
-        # iou of targets-anchors (using wh only)
-        box1 = gwh
-        box2 = anchor_vec.unsqueeze(1)
+    return loss, d
 
-        inter_area = torch.min(box1, box2).prod(2)
-        iou = inter_area / (box1.prod(1) + box2.prod(2) - inter_area + 1e-16)
 
-        # Select best iou_pred and anchor
-        iou_best, a = iou.max(0)  # best anchor [0-2] for each target
+def build_targets(model, targets, pred):
+    # targets = [image, class, x, y, w, h]
+    if isinstance(model, torch.nn.DataParallel):
+        model = model.module
+    yolo_layers = get_yolo_layers(model)
 
-        # Select best unique target-anchor combinations
-        if nTb > 1:
-            iou_order = torch.argsort(-iou_best)  # best to worst
+    anchors = closest_anchor(model, targets)  # [layer, anchor, i, j]
+    txy, twh, tcls, tconf, indices = [], [], [], [], []
+    for i, layer in enumerate(yolo_layers):
+        nG = model.module_list[layer][0].nG  # grid size
+        anchor_vec = model.module_list[layer][0].anchor_vec
 
-            # Unique anchor selection
-            u = torch.stack((gi, gj, a), 0)[:, iou_order]
-            # _, first_unique = np.unique(u, axis=1, return_index=True)  # first unique indices
-            first_unique = return_torch_unique_index(u, torch.unique(u, dim=1))  # torch alternative
+        j = anchors[0] == i  # layer i anchor indices
+        ai = anchors[:, j]  # layer i anchors
 
-            i = iou_order[first_unique]
-            # best anchor must share significant commonality (iou) with target
-            i = i[iou_best[i] > 0.10]  # TODO: examine arbitrary threshold
-            if len(i) == 0:
-                continue
+        # reject below threshold ious
+        j = ai[4] > 0.01
+        ai = ai[:, j]
 
-            a, gj, gi, t = a[i], gj[i], gi[i], t[i]
-            if len(t.shape) == 1:
-                t = t.view(1, 5)
-        else:
-            if iou_best < 0.10:
-                continue
-
-        tc, gxy, gwh = t[:, 0].long(), t[:, 1:3] * nG, t[:, 3:5] * nG
+        # Indices
+        b, c = targets[j, 0:2].long().t()  # target image, class
+        a, gi, gj = ai[1:4].long()  # anchor, grid_i, grid_j
+        indices.append((b, a, gj, gi))
 
         # XY coordinates
-        txy[b, a, gj, gi] = gxy - gxy.floor()
+        gxy = targets[j, 2:4] * nG
+        txy.append(gxy - gxy.floor())
 
         # Width and height
-        twh[b, a, gj, gi] = torch.log(gwh / anchor_vec[a])  # yolo method
-        # twh[b, a, gj, gi] = torch.sqrt(gwh / anchor_vec[a]) / 2 # power method
+        gwh = targets[j, 4:6] * nG
+        twh.append(torch.log(gwh / anchor_vec[a]))  # yolo method
+        # twh.append(torch.sqrt(gwh / anchor_vec[a]) / 2)  # power method
 
-        # One-hot encoding of label
-        tcls[b, a, gj, gi, tc] = 1
-        tconf[b, a, gj, gi] = 1
+        # Class
+        tcls.append(c)
 
-    return txy, twh, tconf, tcls
+        # Conf
+        tci = torch.zeros_like(pred[i][..., 0])
+        tci[b, a, gj, gi] = 1  # conf
+        tconf.append(tci)
+
+    return txy, twh, tcls, tconf, indices
+
+
+def closest_anchor(model, targets):
+    FT = torch.cuda.FloatTensor if targets.is_cuda else torch.FloatTensor
+    yolo_layers = get_yolo_layers(model)
+
+    # Get ious from targets to nearest anchors
+    gij, iou, biou = [], [], []
+    box1 = targets[:, 2:6] * FT([0, 0, 1, 1])  # normalized bounding box
+    a, layer = [], []  # anchor, layer
+    for i, l in enumerate(yolo_layers):
+        nG = model.module_list[l][0].nG
+        anchor_vec = model.module_list[l][0].anchor_vec
+
+        gij.append((targets[:, 2:4] * nG).floor())
+
+        # iou of targets-anchors
+        iou = []
+        for anchor in anchor_vec:
+            box2 = torch.cat((FT([[0, 0]]), anchor.unsqueeze(0)), 1) / nG
+            iou.append(bbox_iou(box1, box2, x1y1x2y2=False))
+
+        best_iou, best_anchor = torch.stack(iou, 0).max(0)
+        biou.append(best_iou)
+        a.append(best_anchor)  # best anchor (0-2)
+        # a.append(torch.stack(iou, 0).argmax(0))  # best anchor (0-2)
+        layer.append(a[i] * 0 + i)  # yolo layer (0-2)
+
+    a = torch.cat(a, 0).unsqueeze(1)
+    layer = torch.cat(layer, 0).unsqueeze(1)
+    biou = torch.cat(biou, 0).unsqueeze(1)
+    gij = torch.cat(gij, 0)
+    # out = [yolo_layer (0-2), anchor (0-2), grid_ij (0-52)]
+    return torch.cat((layer.float(), a.float(), gij, biou), 1).t()
 
 
 def non_max_suppression(prediction, conf_thres=0.5, nms_thres=0.4):
@@ -426,6 +466,11 @@ def non_max_suppression(prediction, conf_thres=0.5, nms_thres=0.4):
                 output[image_i] = det_max if output[image_i] is None else torch.cat((output[image_i], det_max))
 
     return output
+
+
+def get_yolo_layers(model):
+    bool_vec = [x['type'] == 'yolo' for x in model.module_defs]
+    return [i for i, x in enumerate(bool_vec) if x]  # [82, 94, 106] for yolov3
 
 
 def return_torch_unique_index(u, uv):
