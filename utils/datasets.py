@@ -2,13 +2,49 @@ import glob
 import math
 import os
 import random
-
+import xml.etree.ElementTree as ET
 import cv2
 import numpy as np
 import torch
-
-# from torch.utils.data import Dataset
 from utils.utils import xyxy2xywh
+
+xy_dict = {'boat': 0, 'person': 1}
+
+def parse_rec(filename,new_file_name='',n_class=-1):
+    """parse a pascal voc xml file"""
+    tree = ET.parse(filename) # 
+    objects = []
+    obj_struct = {}
+    ssize = tree.find('size')
+    w = float(ssize.find('width').text)
+    h = float(ssize.find('height').text)
+    objects.append(obj_struct)
+    result = []
+    n=0
+    for obj in tree.findall('object'):
+        #obj.find('name').text = 'boat'
+        obj_struct = {}
+        obj_struct['name'] = obj.find('name').text
+        bbox = obj.find('bndbox')
+        obj_struct['bbox'] = [int(bbox.find('xmin').text),
+                              int(bbox.find('ymin').text),
+                              int(bbox.find('xmax').text),
+                              int(bbox.find('ymax').text)]
+        objects.append(obj_struct)
+        # x_center = (obj_struct['bbox'][0]+obj_struct['bbox'][2])/2.0/w
+        # y_center = (obj_struct['bbox'][1]+obj_struct['bbox'][3])/2.0/h
+        # temp_w = (obj_struct['bbox'][2]-obj_struct['bbox'][0])/w
+        # temp_h = (obj_struct['bbox'][3]-obj_struct['bbox'][1])/h
+        if xy_dict.__contains__(obj_struct['name']):
+            temp=[xy_dict[obj_struct['name']]] +obj_struct['bbox']
+        else:
+            temp= [n_class] +obj_struct['bbox']
+        result.append(temp)
+        n=n+1
+    if new_file_name is not '':
+        tree.write(new_file_name, 'UTF-8')
+    #
+    return  np.array(result)
 
 
 class LoadImages:  # for inference
@@ -90,14 +126,21 @@ class LoadWebcam:  # for inference
 
 
 class LoadImagesAndLabels:  # for training
-    def __init__(self, path, batch_size=1, img_size=608, multi_scale=False, augment=False):
-        with open(path, 'r') as file:
+    def __init__(self, path,txt_name, batch_size=1, img_size=608, multi_scale=False, augment=False):
+        self.label_dict = dict()
+        self.path = path
+        lists = os.listdir(path)
+        for file_name in lists:
+            if (file_name[-3::]=='jpg'):
+                temp_key =file_name[:-4]
+                temp_file_name = file_name.replace('.jpg','.xml')
+                if os.access(path+'xml/'+temp_file_name, os.R_OK):
+                    temp = parse_rec(path+'xml/'+temp_file_name)
+                    self.label_dict[temp_key] = temp
+        with open(path+txt_name, 'r') as file:
             self.img_files = file.readlines()
             self.img_files = [x.replace('\n', '') for x in self.img_files]
             self.img_files = list(filter(lambda x: len(x) > 0, self.img_files))
-
-        self.label_files = [x.replace('images', 'labels').replace('.png', '.txt').replace('.jpg', '.txt')
-                            for x in self.img_files]
 
         self.nF = len(self.img_files)  # number of image files
         self.nB = math.ceil(self.nF / batch_size)  # number of batches
@@ -130,9 +173,8 @@ class LoadImagesAndLabels:  # for training
 
         img_all, labels_all, img_paths, img_shapes = [], [], [], []
         for index, files_index in enumerate(range(ia, ib)):
-            img_path = self.img_files[self.shuffled_vector[files_index]]
-            label_path = self.label_files[self.shuffled_vector[files_index]]
-
+            img_key = self.img_files[self.shuffled_vector[files_index]]
+            img_path = self.path+img_key+'.jpg'
             img = cv2.imread(img_path)  # BGR
             assert img is not None, 'File Not Found ' + img_path
 
@@ -162,6 +204,7 @@ class LoadImagesAndLabels:  # for training
             img, ratio, padw, padh = letterbox(img, height=height)
 
             # Load labels
+            labels =[]
             if os.path.isfile(label_path):
                 labels0 = np.loadtxt(label_path, dtype=np.float32).reshape(-1, 5)
 
