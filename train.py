@@ -15,10 +15,9 @@ def train(
         resume=True,
         epochs=100,
         batch_size=16,
-        accumulated_batches=1,
+        accumulate=1,
         multi_scale=False,
         freeze_backbone=False,
-        var=0,
 ):
     # 训练的调试阶段
     run_dir = 'run'
@@ -34,8 +33,8 @@ def train(
     best = weights + 'best.pt'
     device = torch_utils.select_device()
 
-    if multi_scale:  # pass maximum multi_scale size
-        img_size = 608
+    if multi_scale:
+        img_size = 608  # initiate with maximum multi_scale size
     else:
         torch.backends.cudnn.benchmark = True  # unsuitable for multiscale
 
@@ -50,7 +49,7 @@ def train(
     dataloader = LoadImagesAndLabels(options['folder'],options['train'],
                  batch_size, img_size, multi_scale=multi_scale, augment=True)
 
-    lr0 = 0.001
+    lr0 = 0.001  # initial learning rate
     cutoff = -1  # backbone reaches to cutoff layer
     start_epoch = 0
     best_loss = float('inf')
@@ -117,30 +116,35 @@ def train(
         model.to(device).train()
 
         # Set optimizer
-        optimizer = torch.optim.SGD(filter(lambda x: x.requires_grad, model.parameters()), lr=lr0, momentum=.9)
+        optimizer = torch.optim.SGD(model.parameters(), lr=lr0, momentum=.9)
+
+    if torch.cuda.device_count() > 1:
+        model = nn.DataParallel(model)
+    model.to(device).train()
 
     # Set scheduler
     # scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[54, 61], gamma=0.1)
     # Start training
     t0 = time.time()
     model_info(model)
-    n_burnin = min(round(dataloader.nB / 5 + 1), 1000)  # number of burn-in batches
+    n_burnin = min(round(len(dataloader) / 5 + 1), 1000)  # burn-in batches
     for epoch in range(epochs):
+        model.train()
         epoch += start_epoch
 
-        print(('%8s%12s' + '%10s' * 7) % (
+        print(('\n%8s%12s' + '%10s' * 7) % (
             'Epoch', 'Batch', 'xy', 'wh', 'conf', 'cls', 'total', 'nTargets', 'time'))
 
         # Update scheduler (automatic)
         # scheduler.step()
 
-        # Update scheduler (manual)  at 0, 54, 61 epochs to 1e-3, 1e-4, 1e-5
-        if epoch > 50:
+        # Update scheduler (manual)
+        if epoch > 250:
             lr = lr0 / 10
         else:
             lr = lr0
-        for g in optimizer.param_groups:
-            g['lr'] = lr
+        for x in optimizer.param_groups:
+            x['lr'] = lr
 
         # Freeze darknet53.conv.74 for first epoch
         if freeze_backbone and (epoch == 0):
@@ -158,10 +162,16 @@ def train(
                 continue
 
             # SGD burn-in
-            if (epoch == 0) & (i <= n_burnin):
+            if (epoch == 0) and (i <= n_burnin):
                 lr = lr0 * (i / n_burnin) ** 4
-                for g in optimizer.param_groups:
-                    g['lr'] = lr
+                for x in optimizer.param_groups:
+                    x['lr'] = lr
+
+            # Run model
+            pred = model(imgs.to(device))
+
+            # Build targets
+            target_list = build_targets(model, targets, pred)
 
             # Run model
             pred = model(imgs.to(device))
@@ -177,7 +187,7 @@ def train(
             loss.backward()
 
             # Accumulate gradient for x batches before optimizing
-            if ((i + 1) % accumulated_batches == 0) or (i == len(dataloader) - 1):
+            if (i + 1) % accumulate == 0 or (i + 1) == len(dataloader):
                 optimizer.step()
                 optimizer.zero_grad()
 
@@ -257,7 +267,6 @@ if __name__ == '__main__':
         resume=opt.resume,
         epochs=opt.epochs,
         batch_size=opt.batch_size,
-        accumulated_batches=opt.accumulated_batches,
+        accumulate=opt.accumulate,
         multi_scale=opt.multi_scale,
-        var=opt.var,
     )

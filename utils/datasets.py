@@ -80,9 +80,9 @@ class LoadImages:  # for inference
         img, _, _, _ = letterbox(img0, height=self.height)
 
         # Normalize RGB
-        img = img[:, :, ::-1].transpose(2, 0, 1)
-        img = np.ascontiguousarray(img, dtype=np.float32)
-        img /= 255.0
+        img = img[:, :, ::-1].transpose(2, 0, 1)  # BGR to RGB
+        img = np.ascontiguousarray(img, dtype=np.float32)  # uint8 to float32
+        img /= 255.0  # 0 - 255 to 0.0 - 1.0
 
         # cv2.imwrite(img_path + '.letterbox.jpg', 255 * img.transpose((1, 2, 0))[:, :, ::-1])  # save letterbox image
         return img_path, img, img0
@@ -110,15 +110,15 @@ class LoadWebcam:  # for inference
         ret_val, img0 = self.cam.read()
         assert ret_val, 'Webcam Error'
         img_path = 'webcam_%g.jpg' % self.count
-        img0 = cv2.flip(img0, 1)
+        img0 = cv2.flip(img0, 1)  # flip left-right
 
         # Padded resize
         img, _, _, _ = letterbox(img0, height=self.height)
 
         # Normalize RGB
-        img = img[:, :, ::-1].transpose(2, 0, 1)
-        img = np.ascontiguousarray(img, dtype=np.float32)
-        img /= 255.0
+        img = img[:, :, ::-1].transpose(2, 0, 1)  # BGR to RGB
+        img = np.ascontiguousarray(img, dtype=np.float32)  # uint8 to float32
+        img /= 255.0  # 0 - 255 to 0.0 - 1.0
 
         return img_path, img, img0
 
@@ -150,8 +150,7 @@ class LoadImagesAndLabels:  # for training
         self.nF = len(self.img_files)  # number of image files
         self.nB = math.ceil(self.nF / batch_size)  # number of batches
         self.batch_size = batch_size
-        self.height = img_size
-        self.multi_scale = multi_scale
+        self.img_size = img_size
         self.augment = augment
 
         assert self.nF > 0, 'No images found in %s' % path
@@ -168,13 +167,6 @@ class LoadImagesAndLabels:  # for training
 
         ia = self.count * self.batch_size
         ib = min((self.count + 1) * self.batch_size, self.nF)
-
-        if self.multi_scale:
-            # Multi-Scale YOLO Training
-            height = random.choice(range(10, 20)) * 32  # 320 - 608 pixels
-        else:
-            # Fixed-Scale YOLO Training
-            height = self.height
 
         img_all, labels_all, img_paths, img_shapes = [], [], [], []
         for index, files_index in enumerate(range(ia, ib)):
@@ -206,7 +198,7 @@ class LoadImagesAndLabels:  # for training
                 cv2.cvtColor(img_hsv, cv2.COLOR_HSV2BGR, dst=img)
 
             h, w, _ = img.shape
-            img, ratio, padw, padh = letterbox(img, height=height)
+            img, ratio, padw, padh = letterbox(img, height=self.img_size)
 
             # Load labels
             labels0 = self.label_dict[img_key].copy()
@@ -236,7 +228,7 @@ class LoadImagesAndLabels:  # for training
             nL = len(labels)
             if nL > 0:
                 # convert xyxy to xywh
-                labels[:, 1:5] = xyxy2xywh(labels[:, 1:5].copy()) / height
+                labels[:, 1:5] = xyxy2xywh(labels[:, 1:5].copy()) / self.img_size
 
             if self.augment:
                 # random left-right flip
@@ -262,9 +254,9 @@ class LoadImagesAndLabels:  # for training
             img_shapes.append((h, w))
 
         # Normalize
-        img_all = np.stack(img_all)[:, :, :, ::-1].transpose(0, 3, 1, 2)  # BGR to RGB and cv2 to pytorch
-        img_all = np.ascontiguousarray(img_all, dtype=np.float32)
-        img_all /= 255.0
+        img_all = np.stack(img_all)[:, :, :, ::-1].transpose(0, 3, 1, 2)  # list to np.array and BGR to RGB
+        img_all = np.ascontiguousarray(img_all, dtype=np.float32)  # uint8 to float32
+        img_all /= 255.0  # 0 - 255 to 0.0 - 1.0
 
         labels_all = torch.from_numpy(np.concatenate(labels_all, 0))
         return torch.from_numpy(img_all), labels_all, img_paths, img_shapes
