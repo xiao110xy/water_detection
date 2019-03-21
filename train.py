@@ -5,13 +5,14 @@ import test  # Import test.py to get mAP after each epoch
 from models import *
 from utils.datasets import *
 from utils.utils import *
-
+from utils.summaries import TensorboardSummary
+from collections import OrderedDict
 
 def train(
         cfg,
         data_cfg,
         img_size=416,
-        resume=False,
+        resume=True,
         epochs=100,
         batch_size=16,
         accumulated_batches=1,
@@ -19,6 +20,15 @@ def train(
         freeze_backbone=False,
         var=0,
 ):
+    # 训练的调试阶段
+    run_dir = 'run'
+    if not os.path.isdir(run_dir):
+        os.makedirs(run_dir)
+    lists = os.listdir(run_dir)
+    run_path = run_dir+'/'+str(len(lists)+1)
+    summary = TensorboardSummary(run_path)
+   # writer = summary.create_summary()
+    #
     weights = 'weights' + os.sep
     latest = weights + 'latest.pt'
     best = weights + 'best.pt'
@@ -44,11 +54,19 @@ def train(
     cutoff = -1  # backbone reaches to cutoff layer
     start_epoch = 0
     best_loss = float('inf')
-    if resume:
+    if False:
         checkpoint = torch.load(latest, map_location='cpu')
-
+        state_dict = checkpoint['model']
+       
+        new_state_dict = OrderedDict()
+        for k, v in state_dict.items():
+            if 'module.' in k:
+                namekey = k[7:] # remove `module.`
+                new_state_dict[namekey] = v
+            else:
+                new_state_dict[k] = v
+        model.load_state_dict(new_state_dict)
         # Load weights to resume from
-        model.load_state_dict(checkpoint['model'])
 
         if torch.cuda.device_count() > 1:
             model = nn.DataParallel(model)
@@ -70,13 +88,30 @@ def train(
 
     else:
         # Initialize model with backbone (optional)
-        if cfg.endswith('yolov3.cfg'):
-            load_darknet_weights(model, weights + 'darknet53.conv.74')
-            cutoff = 75
-        elif cfg.endswith('yolov3-tiny.cfg'):
-            load_darknet_weights(model, weights + 'yolov3-tiny.conv.15')
-            cutoff = 15
+        # if cfg.endswith('yolov3.cfg'):
+        #     load_darknet_weights(model, weights + 'darknet53.conv.74')
+        #     cutoff = 75
+        # elif cfg.endswith('yolov3-tiny.cfg'):
+        #     load_darknet_weights(model, weights + 'yolov3-tiny.conv.15')
+        #     cutoff = 15
 
+        # Transfer learning (train only YOLO layers)
+        checkpoint = torch.load('weights/yolov3.pt', map_location='cpu')
+        state_dict = checkpoint['model']
+
+        new_state_dict = model.state_dict()
+        for k, v in state_dict.items():
+            if bool(len(v.shape)) and v.shape[0] ==255:
+                continue
+            if 'module.' in k:
+                namekey = k[7:] # remove `module.`
+                new_state_dict[namekey] = v
+            else:
+                new_state_dict[k] = v
+        model.load_state_dict(new_state_dict)
+
+        # for i, (name, p) in enumerate(model.named_parameters()):
+        #     p.requires_grad = True if (p.shape[0] == 24) else False
         if torch.cuda.device_count() > 1:
             model = nn.DataParallel(model)
         model.to(device).train()
@@ -86,7 +121,6 @@ def train(
 
     # Set scheduler
     # scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[54, 61], gamma=0.1)
-
     # Start training
     t0 = time.time()
     model_info(model)
@@ -152,68 +186,70 @@ def train(
             for key, val in loss_dict.items():
                 rloss[key] = (rloss[key] * ui + val) / (ui + 1)
 
-            s = ('%8s%12s' + '%10.3g' * 7) % (
+            s = ('%8s%12s' + '%10.5g' * 7) % (
                 '%g/%g' % (epoch, epochs - 1),
                 '%g/%g' % (i, len(dataloader) - 1),
                 rloss['xy'], rloss['wh'], rloss['conf'],
                 rloss['cls'], rloss['total'],
                 nT, time.time() - t0)
             t0 = time.time()
+            
             print(s)
 
         # Update best loss
-<<<<<<< HEAD
-        if rloss['loss'] < best_loss:
-            best_loss = rloss['loss']
-=======
         if rloss['total'] < best_loss:
             best_loss = rloss['total']
->>>>>>> multi_gpu
-
-        # Save latest checkpoint
-        checkpoint = {'epoch': epoch,
+            checkpoint = {'epoch': epoch,
                       'best_loss': best_loss,
                       'model': model.state_dict(),
                       'optimizer': optimizer.state_dict()}
-        torch.save(checkpoint, latest)
+            torch.save(checkpoint, best)
 
-        # Save best checkpoint
-<<<<<<< HEAD
-        if best_loss == rloss['loss']:
-=======
-        if best_loss == rloss['total']:
->>>>>>> multi_gpu
-            os.system('cp ' + latest + ' ' + best)
+        # Save latest checkpoint
 
         # Save backup weights every 5 epochs (optional)
-        # if (epoch > 0) & (epoch % 5 == 0):
-        #     os.system('cp ' + latest + ' ' + weights + 'backup{}.pt'.format(epoch)))
+        if (epoch > 0) & (epoch % 20 == 0):
+            checkpoint = {'epoch': epoch,
+                'best_loss': best_loss,
+                'model': model.state_dict(),
+                'optimizer': optimizer.state_dict()}
+            torch.save(checkpoint, latest)
 
-        # Calculate mAP
-        with torch.no_grad():
-            mAP, R, P = test.test(cfg, data_cfg, weights=latest, batch_size=batch_size, img_size=img_size)
+            # Calculate mAP
+            with torch.no_grad():
+                temp_model = Darknet(cfg, img_size)
+                new_state_dict = OrderedDict()
+                for k, v in model.state_dict().items():
+                    if 'module.' in k:
+                        namekey = k[7:] # remove `module.`
+                        new_state_dict[namekey] = v
+                    else:
+                        new_state_dict[k] = v
+                temp_model.load_state_dict(new_state_dict)
+                mAP, R, P = test.test(temp_model, data_cfg, batch_size=batch_size, img_size=img_size)
 
-        # Write epoch results
-        with open('results.txt', 'a') as file:
-            file.write(s + '%11.3g' * 3 % (mAP, P, R) + '\n')
+                # Write epoch results
+                with open('results.txt', 'a') as file:
+                    file.write(s + '%11.3g' * 3 % (mAP, P, R) + '\n')
+    #writer.close()
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--epochs', type=int, default=100, help='number of epochs')
-    parser.add_argument('--batch-size', type=int, default=16, help='size of each image batch')
+    parser.add_argument('--epochs', type=int, default=10000, help='number of epochs')
+    parser.add_argument('--batch-size', type=int, default=20, help='size of each image batch')
     parser.add_argument('--accumulated-batches', type=int, default=1, help='number of batches before optimizer step')
-    parser.add_argument('--cfg', type=str, default='cfg/yolov3.cfg', help='cfg file path')
+    parser.add_argument('--cfg', type=str, default='cfg/xy_yolov3.cfg', help='cfg file path')
     parser.add_argument('--data-cfg', type=str, default='cfg/xy.data', help='coco.data file path')
     parser.add_argument('--multi-scale', action='store_true', help='random image sizes per batch 320 - 608')
     parser.add_argument('--img-size', type=int, default=32 * 13, help='pixels')
-    parser.add_argument('--resume', action='store_true', help='resume training flag')
+    parser.add_argument('--resume', action='store_true',default=True, help='resume training flag')
     parser.add_argument('--var', type=float, default=0, help='test variable')
     opt = parser.parse_args()
     print(opt, end='\n\n')
 
     init_seeds()
-
+    
     train(
         opt.cfg,
         opt.data_cfg,

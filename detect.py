@@ -7,36 +7,30 @@ from sys import platform
 from models import *
 from utils.datasets import *
 from utils.utils import *
-
+from collections import OrderedDict
 
 def detect(
-        cfg,
-        weights,
-        images,
+        model,
+        images = 'input',
         output='output',  # output folder
         img_size=416,
-        conf_thres=0.3,
-        nms_thres=0.45,
+        conf_thres=0.6,
+        nms_thres=0.3,
         save_txt=False,
         save_images=True,
         webcam=False
 ):
     device = torch_utils.select_device()
-    if os.path.exists(output):
-        shutil.rmtree(output)  # delete output folder
-    os.makedirs(output)  # make new output folder
-
-    # Initialize model
-    model = Darknet(cfg, img_size)
-
-    # Load weights
-    if weights.endswith('.pt'):  # pytorch format
-        if weights.endswith('yolov3.pt') and not os.path.exists(weights):
-            if (platform == 'darwin') or (platform == 'linux'):
-                os.system('wget https://storage.googleapis.com/ultralytics/yolov3.pt -O ' + weights)
-        model.load_state_dict(torch.load(weights, map_location='cpu')['model'])
-    else:  # darknet format
-        load_darknet_weights(model, weights)
+    if not os.path.exists(output):
+        os.makedirs(output)  # make new output folder
+    # # Load weights
+    # if weights.endswith('.pt'):  # pytorch format
+    #     if weights.endswith('yolov3.pt') and not os.path.exists(weights):
+    #         if (platform == 'darwin') or (platform == 'linux'):
+    #             os.system('wget https://storage.googleapis.com/ultralytics/yolov3.pt -O ' + weights)
+    #     model.load_state_dict(torch.load(weights, map_location='cpu')['model'])
+    # else:  # darknet format
+    #     load_darknet_weights(model, weights)
 
     model.to(device).eval()
 
@@ -48,7 +42,7 @@ def detect(
         dataloader = LoadImages(images, img_size=img_size)
 
     # Get classes and colors
-    classes = load_classes(parse_data_cfg('cfg/coco.data')['names'])
+    classes = ['boat','person']
     colors = [[random.randint(0, 255), random.randint(0, 255), random.randint(0, 255)] for _ in range(len(classes))]
 
     for i, (path, img, im0) in enumerate(dataloader):
@@ -78,6 +72,7 @@ def detect(
             unique_classes = detections[:, -1].cpu().unique()
             for c in unique_classes:
                 n = (detections[:, -1].cpu() == c).sum()
+
                 print('%g %ss' % (n, classes[int(c)]), end=', ')
 
             # Draw bounding boxes and labels of detections
@@ -106,21 +101,29 @@ def detect(
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--cfg', type=str, default='cfg/yolov3.cfg', help='cfg file path')
+    parser.add_argument('--cfg', type=str, default='cfg/xy_yolov3.cfg', help='cfg file path')
     parser.add_argument('--weights', type=str, default='weights/latest.pt', help='path to weights file')
-    parser.add_argument('--images', type=str, default='data/samples', help='path to images')
+    parser.add_argument('--images', type=str, default='input', help='path to images')
     parser.add_argument('--img-size', type=int, default=32 * 13, help='size of each image dimension')
-    parser.add_argument('--conf-thres', type=float, default=0.50, help='object confidence threshold')
+    parser.add_argument('--conf-thres', type=float, default=0.70, help='object confidence threshold')
     parser.add_argument('--nms-thres', type=float, default=0.45, help='iou threshold for non-maximum suppression')
     opt = parser.parse_args()
     print(opt)
 
     with torch.no_grad():
+        model = Darknet(opt.cfg, opt.img_size)
+        # Load weights
+        weights = 'weights/best.pt'
+        if weights.endswith('.pt'):  # pytorch format
+            state_dict = torch.load(weights, map_location='cpu')['model']
+            new_state_dict = OrderedDict()
+            for k, v in state_dict.items():
+                if 'module.' in k:
+                    namekey = k[7:] # remove `module.`
+                    new_state_dict[namekey] = v
+                else:
+                    new_state_dict[k] = v
+            model.load_state_dict(new_state_dict)
         detect(
-            opt.cfg,
-            opt.weights,
-            opt.images,
-            img_size=opt.img_size,
-            conf_thres=opt.conf_thres,
-            nms_thres=opt.nms_thres
+            model
         )

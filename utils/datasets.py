@@ -8,9 +8,10 @@ import numpy as np
 import torch
 from utils.utils import xyxy2xywh
 
+class_name = ['boat','person']
 xy_dict = {'boat': 0, 'person': 1}
 
-def parse_rec(filename,new_file_name='',n_class=-1):
+def parse_rec(filename,new_file_name='',n_class=0):
     """parse a pascal voc xml file"""
     tree = ET.parse(filename) # 
     objects = []
@@ -20,7 +21,6 @@ def parse_rec(filename,new_file_name='',n_class=-1):
     h = float(ssize.find('height').text)
     objects.append(obj_struct)
     result = []
-    n=0
     for obj in tree.findall('object'):
         #obj.find('name').text = 'boat'
         obj_struct = {}
@@ -31,16 +31,17 @@ def parse_rec(filename,new_file_name='',n_class=-1):
                               int(bbox.find('xmax').text),
                               int(bbox.find('ymax').text)]
         objects.append(obj_struct)
-        # x_center = (obj_struct['bbox'][0]+obj_struct['bbox'][2])/2.0/w
-        # y_center = (obj_struct['bbox'][1]+obj_struct['bbox'][3])/2.0/h
-        # temp_w = (obj_struct['bbox'][2]-obj_struct['bbox'][0])/w
-        # temp_h = (obj_struct['bbox'][3]-obj_struct['bbox'][1])/h
+        x_center = (obj_struct['bbox'][0]+obj_struct['bbox'][2])/2.0/w
+        y_center = (obj_struct['bbox'][1]+obj_struct['bbox'][3])/2.0/h
+        temp_w = (obj_struct['bbox'][2]-obj_struct['bbox'][0])/w
+        temp_h = (obj_struct['bbox'][3]-obj_struct['bbox'][1])/h
         if xy_dict.__contains__(obj_struct['name']):
-            temp=[xy_dict[obj_struct['name']]] +obj_struct['bbox']
+            temp=[xy_dict[obj_struct['name']],x_center,y_center,temp_w,temp_h]
+            result.append(temp)
         else:
-            temp= [n_class] +obj_struct['bbox']
-        result.append(temp)
-        n=n+1
+            inee = 1
+            x = inee
+
     if new_file_name is not '':
         tree.write(new_file_name, 'UTF-8')
     #
@@ -50,7 +51,7 @@ def parse_rec(filename,new_file_name='',n_class=-1):
 class LoadImages:  # for inference
     def __init__(self, path, img_size=416):
         if os.path.isdir(path):
-            image_format = ['.jpg', '.jpeg', '.png', '.tif']
+            image_format = ['.jpg', '.jpeg', '.png', '.tif','.bmp']
             self.files = sorted(glob.glob('%s/*.*' % path))
             self.files = list(filter(lambda x: os.path.splitext(x)[1].lower() in image_format, self.files))
         elif os.path.isfile(path):
@@ -126,22 +127,26 @@ class LoadWebcam:  # for inference
 
 
 class LoadImagesAndLabels:  # for training
-    def __init__(self, path,txt_name, batch_size=1, img_size=608, multi_scale=False, augment=False):
+    def __init__(self, paths,txt_name, batch_size=1, img_size=608, multi_scale=False, augment=False):
         self.label_dict = dict()
-        self.path = path
-        lists = os.listdir(path)
-        for file_name in lists:
-            if (file_name[-3::]=='jpg'):
-                temp_key =file_name[:-4]
-                temp_file_name = file_name.replace('.jpg','.xml')
-                if os.access(path+'xml/'+temp_file_name, os.R_OK):
-                    temp = parse_rec(path+'xml/'+temp_file_name)
-                    self.label_dict[temp_key] = temp
-        with open(path+txt_name, 'r') as file:
-            self.img_files = file.readlines()
-            self.img_files = [x.replace('\n', '') for x in self.img_files]
-            self.img_files = list(filter(lambda x: len(x) > 0, self.img_files))
-
+        self.paths = paths.split(',')
+        self.img_files = []
+        for path in self.paths:
+            lists = os.listdir(path+'JPEGImages')
+            for file_name in lists:
+                if file_name[-3::]=='jpg':
+                    temp_key =path+'key'+file_name[:-4]
+                    temp_file_name = file_name.replace('.jpg','.xml')
+                    if os.access(path+'Annotations/'+temp_file_name, os.R_OK):
+                        temp = parse_rec(path+'Annotations/'+temp_file_name)
+                        if temp.size is not 0:
+                            self.label_dict[temp_key] = temp
+            if os.path.exists(path+txt_name):
+                with open(path+txt_name, 'r') as file:
+                    img_files = file.readlines()
+                    img_files = [path+'key'+x.replace('\n', '') for x in img_files]
+                    self.img_files = self.img_files +list(filter(lambda x: len(x) > 0, img_files))
+        self.img_files = [x for x in self.img_files if self.label_dict.__contains__(x)]
         self.nF = len(self.img_files)  # number of image files
         self.nB = math.ceil(self.nF / batch_size)  # number of batches
         self.batch_size = batch_size
@@ -174,7 +179,7 @@ class LoadImagesAndLabels:  # for training
         img_all, labels_all, img_paths, img_shapes = [], [], [], []
         for index, files_index in enumerate(range(ia, ib)):
             img_key = self.img_files[self.shuffled_vector[files_index]]
-            img_path = self.path+img_key+'.jpg'
+            img_path = img_key.replace('key','JPEGImages/')+'.jpg'
             img = cv2.imread(img_path)  # BGR
             assert img is not None, 'File Not Found ' + img_path
 
@@ -204,23 +209,22 @@ class LoadImagesAndLabels:  # for training
             img, ratio, padw, padh = letterbox(img, height=height)
 
             # Load labels
-            labels =[]
-            if os.path.isfile(label_path):
-                labels0 = np.loadtxt(label_path, dtype=np.float32).reshape(-1, 5)
+            labels0 = self.label_dict[img_key].copy()
+            # Normalized xywh to pixel xyxy format
+            labels =labels0.copy()
+            labels[:, 1] = ratio * w * (labels0[:, 1] - labels0[:, 3] / 2) + padw
+            labels[:, 2] = ratio * h * (labels0[:, 2] - labels0[:, 4] / 2) + padh
+            labels[:, 3] = ratio * w * (labels0[:, 1] + labels0[:, 3] / 2) + padw
+            labels[:, 4] = ratio * h * (labels0[:, 2] + labels0[:, 4] / 2) + padh
+            labels =  labels.astype(np.float32)
 
-                # Normalized xywh to pixel xyxy format
-                labels = labels0.copy()
-                labels[:, 1] = ratio * w * (labels0[:, 1] - labels0[:, 3] / 2) + padw
-                labels[:, 2] = ratio * h * (labels0[:, 2] - labels0[:, 4] / 2) + padh
-                labels[:, 3] = ratio * w * (labels0[:, 1] + labels0[:, 3] / 2) + padw
-                labels[:, 4] = ratio * h * (labels0[:, 2] + labels0[:, 4] / 2) + padh
-            else:
-                labels = np.array([])
-
+  
             # Augment image and labels
             if self.augment:
-                img, labels, M = random_affine(img, labels, degrees=(-5, 5), translate=(0.10, 0.10), scale=(0.90, 1.10))
-
+                temp_img, temp_labels, M = random_affine(img, labels, degrees=(-5, 5), translate=(0.10, 0.10), scale=(0.90, 1.10))
+                if len(temp_labels) is not 0:
+                    img = temp_img
+                    labels = temp_labels
             plotFlag = False
             if plotFlag:
                 import matplotlib.pyplot as plt
@@ -343,7 +347,7 @@ def random_affine(img, targets=None, degrees=(-10, 10), translate=(.1, .1), scal
             h = xy[:, 3] - xy[:, 1]
             area = w * h
             ar = np.maximum(w / (h + 1e-16), h / (w + 1e-16))
-            i = (w > 4) & (h > 4) & (area / (area0 + 1e-16) > 0.1) & (ar < 10)
+            i = (w > 4) & (h > 4) & (area / (area0 + 1e-16) > 0.1)# & (ar < 40)
 
             targets = targets[i]
             targets[:, 1:5] = xy[i]

@@ -6,40 +6,28 @@ from pathlib import Path
 from models import *
 from utils.datasets import *
 from utils.utils import *
-
+from collections import OrderedDict
 
 def test(
-        cfg,
+        model,
         data_cfg,
-        weights,
-        batch_size=16,
+        batch_size=24,
         img_size=416,
         iou_thres=0.5,
-        conf_thres=0.3,
+        conf_thres=0.2,
         nms_thres=0.45,
         save_json=False
 ):
-    device = torch_utils.select_device()
-
+    device = torch_utils.select_device(0)
+    model.to(device).eval()
     # Configure run
     data_cfg_dict = parse_data_cfg(data_cfg)
     nC = int(data_cfg_dict['classes'])  # number of classes (80 for COCO)
-    test_path = data_cfg_dict['valid']
 
-    # Initialize model
-    model = Darknet(cfg, img_size)
-
-    # Load weights
-    if weights.endswith('.pt'):  # pytorch format
-        model.load_state_dict(torch.load(weights, map_location='cpu')['model'])
-    else:  # darknet format
-        load_darknet_weights(model, weights)
-
-    model.to(device).eval()
 
     # Get dataloader
     # dataloader = torch.utils.data.DataLoader(LoadImagesAndLabels(test_path), batch_size=batch_size)
-    dataloader = LoadImagesAndLabels(test_path, batch_size=batch_size, img_size=img_size)
+    dataloader = LoadImagesAndLabels(data_cfg_dict['folder'],data_cfg_dict['valid'],batch_size, img_size)
 
     mean_mAP, mean_R, mean_P, seen = 0.0, 0.0, 0.0, 0
     print('%11s' * 5 % ('Image', 'Total', 'P', 'R', 'mAP'))
@@ -139,36 +127,16 @@ def test(
 
     for i, c in enumerate(load_classes(data_cfg_dict['names'])):
         print('%15s: %-.4f' % (c, AP_accum[i] / (AP_accum_count[i] + 1E-16)))
-
-    # Save JSON
-    if save_json:
-        imgIds = [int(Path(x).stem.split('_')[-1]) for x in dataloader.img_files]
-        with open('results.json', 'w') as file:
-            json.dump(jdict, file)
-
-        from pycocotools.coco import COCO
-        from pycocotools.cocoeval import COCOeval
-
-        # https://github.com/cocodataset/cocoapi/blob/master/PythonAPI/pycocoEvalDemo.ipynb
-        cocoGt = COCO('../coco/annotations/instances_val2014.json')  # initialize COCO ground truth api
-        cocoDt = cocoGt.loadRes('results.json')  # initialize COCO detections api
-
-        cocoEval = COCOeval(cocoGt, cocoDt, 'bbox')
-        cocoEval.params.imgIds = imgIds  # [:32]  # only evaluate these images
-        cocoEval.evaluate()
-        cocoEval.accumulate()
-        cocoEval.summarize()
-
     # Return mAP
     return mean_mAP, mean_R, mean_P
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(prog='test.py')
-    parser.add_argument('--batch-size', type=int, default=32, help='size of each image batch')
-    parser.add_argument('--cfg', type=str, default='cfg/yolov3.cfg', help='cfg file path')
+    parser.add_argument('--batch-size', type=int,default=24, help='size of each image batch')
+    parser.add_argument('--cfg', type=str, default='cfg/xy_yolov3.cfg', help='cfg file path')
     parser.add_argument('--data-cfg', type=str, default='cfg/xy.data', help='coco.data file path')
-    parser.add_argument('--weights', type=str, default='E:/models/yolov3.pt', help='path to weights file')
+    parser.add_argument('--weights', type=str, default='weights/latest.pt', help='path to weights file')
     parser.add_argument('--iou-thres', type=float, default=0.5, help='iou threshold required to qualify as detected')
     parser.add_argument('--conf-thres', type=float, default=0.2, help='object confidence threshold')
     parser.add_argument('--nms-thres', type=float, default=0.45, help='iou threshold for non-maximum suppression')
@@ -176,18 +144,27 @@ if __name__ == '__main__':
     parser.add_argument('--img-size', type=int, default=416, help='size of each image dimension')
     opt = parser.parse_args()
     print(opt, end='\n\n')
-
+    # Initialize model
+    model = Darknet(opt.cfg, opt.img_size)
+    # Load weights
+    weights = 'weights/best.pt'
+    if weights.endswith('.pt'):  # pytorch format
+        state_dict = torch.load(weights, map_location='cpu')['model']
+       
+        new_state_dict = OrderedDict()
+        for k, v in state_dict.items():
+            if 'module.' in k:
+                namekey = k[7:] # remove `module.`
+                new_state_dict[namekey] = v
+            else:
+                new_state_dict[k] = v
+        model.load_state_dict(new_state_dict)
+    else:  # darknet format
+        load_darknet_weights(model, weights)
     with torch.no_grad():
         mAP = test(
-            opt.cfg,
+            model,
             opt.data_cfg,
-            opt.weights,
-            opt.batch_size,
-            opt.img_size,
-            opt.iou_thres,
-            opt.conf_thres,
-            opt.nms_thres,
-            opt.save_json
         )
 
 #       Image      Total          P          R        mAP  # YOLOv3 320
